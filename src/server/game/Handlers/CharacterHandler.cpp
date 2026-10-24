@@ -47,6 +47,7 @@
 #include "Language.h"
 #include "Log.h"
 #include "Mail.h"
+#include "LoginQueryHolder.h"
 #include "Map.h"
 #include "MapUtils.h"
 #include "Metric.h"
@@ -71,18 +72,9 @@
 #include <boost/circular_buffer.hpp>
 #include <sstream>
 
-class LoginQueryHolder : public CharacterDatabaseQueryHolder
-{
-    private:
-        uint32 m_accountId;
-        ObjectGuid m_guid;
-    public:
-        LoginQueryHolder(uint32 accountId, ObjectGuid guid)
-            : m_accountId(accountId), m_guid(guid) { }
-        ObjectGuid GetGuid() const { return m_guid; }
-        uint32 GetAccountId() const { return m_accountId; }
-        bool Initialize();
-};
+// LoginQueryHolder declaration moved to Handlers/LoginQueryHolder.h so the
+// V2 playerbot module can build/submit the same holder for headless bot
+// logins. The Initialize() body still lives here (~250 prepared statements).
 
 bool LoginQueryHolder::Initialize()
 {
@@ -1545,9 +1537,17 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     stmt->setUInt64(0, pCurrChar->GetGUID().GetCounter());
     CharacterDatabase.Execute(stmt);
 
-    LoginDatabasePreparedStatement* loginStmt = LoginDatabase.GetPreparedStatement(LOGIN_UPD_ACCOUNT_ONLINE);
-    loginStmt->setUInt32(0, GetAccountId());
-    LoginDatabase.Execute(loginStmt);
+    // Bot sessions share the owner's account id. Setting account.online=1
+    // here would (in auto-resume mode where the GM is offline) block them
+    // from later logging into their own account — the login server treats
+    // online=1 as "another session active". The character.online flag above
+    // is per-character and correctly reflects the bot's in-world state.
+    if (!IsBot())
+    {
+        LoginDatabasePreparedStatement* loginStmt = LoginDatabase.GetPreparedStatement(LOGIN_UPD_ACCOUNT_ONLINE);
+        loginStmt->setUInt32(0, GetAccountId());
+        LoginDatabase.Execute(loginStmt);
+    }
 
     pCurrChar->SetInGameTime(GameTime::GetGameTimeMS());
 
@@ -1600,7 +1600,7 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     }
 
     // Load pet if any (if player not alive and in taxi flight or another then pet will remember as temporary unsummoned)
-    pCurrChar->ResummonPetTemporaryUnSummonedIfAny();
+    pCurrChar->DelayPetResummon(4000);
 
     // Set FFA PvP for non GM in non-rest mode
     if (sWorld->IsFFAPvPRealm() && !pCurrChar->IsGameMaster() && !pCurrChar->HasPlayerFlag(PLAYER_FLAGS_RESTING))
@@ -1739,10 +1739,13 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     // Battle.net account with an authenticator (support site account page): "account secured", +4 backpack slots and no
     // "attach an Authenticator" prompts. Removing it takes the slots away again (items in them are mailed).
     {
-        bool secured = false;
-        if (QueryResult result = LoginDatabase.PQuery("SELECT COUNT(*) FROM battlenet_accounts WHERE id = {} AND authenticator_secret IS NOT NULL "
-            "AND authenticator_secret <> ''", GetBattlenetAccountId()))
-            secured = (*result)[0].GetUInt64() != 0;
+        bool secured = sWorld->getBoolConfig(CONFIG_CLASSIC_SECURED_BAG_SLOTS_FOR_ALL);
+        if (!secured)
+        {
+            if (QueryResult result = LoginDatabase.PQuery("SELECT COUNT(*) FROM battlenet_accounts WHERE id = {} AND authenticator_secret IS NOT NULL "
+                "AND authenticator_secret <> ''", GetBattlenetAccountId()))
+                secured = (*result)[0].GetUInt64() != 0;
+        }
 
         if (secured)
             pCurrChar->SetAccountSecured(true);

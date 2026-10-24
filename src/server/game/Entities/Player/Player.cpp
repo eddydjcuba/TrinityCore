@@ -271,6 +271,7 @@ Player::Player(WorldSession* session) : Unit(true), m_sceneMgr(this)
     m_titanGripPenaltySpellId = 0;
 
     m_temporaryUnsummonedPetNumber = 0;
+    m_petResummonDelay = 0;
     //cache for CreatedBySpell to allow
     //returning reagents for temporarily removed pets
     //when dying/logging out
@@ -956,6 +957,19 @@ void Player::Update(uint32 p_time)
     Unit::Update(p_time);
     SetCanDelayTeleport(false);
 
+    // The pet remembered at login comes back a moment after the player is in the world, as a summon during play does. Created while the
+    // Classic 1.60 client is still on its loading screen, the client froze on the pet (a warlock's demon out at logout).
+    if (m_petResummonDelay)
+    {
+        if (p_time >= m_petResummonDelay)
+        {
+            m_petResummonDelay = 0;
+            ResummonPetTemporaryUnSummonedIfAny();
+        }
+        else
+            m_petResummonDelay -= p_time;
+    }
+
     DeathRecap::RecordFrame(this, p_time);
     DeathRecap::UpdateViewer(this);
 
@@ -1578,13 +1592,18 @@ void Player::RemoveFromWorld()
         UnsummonPetTemporaryIfAny();
         UnsummonBattlePetTemporaryIfAny();
         SetPower(POWER_COMBO_POINTS, 0);
-        m_session->DoLootReleaseAll();
+        // Null-session guard: a Player can sit briefly in its grid after
+        // its WorldSession has been torn down (logout race). Bot session
+        // churn at scale exposes this routinely; same surface as the
+        // SendDirectMessage crash we already patched.
+        if (m_session) m_session->DoLootReleaseAll();
         m_lootRolls.clear();
         sOutdoorPvPMgr->HandlePlayerLeaveZone(this, m_zoneUpdateId);
         sBattlefieldMgr->HandlePlayerLeaveZone(this, m_zoneUpdateId);
     }
 
-    GetSession()->GetBattlenetAccount().RemoveFromWorld();
+    if (WorldSession* sess = GetSession())
+        sess->GetBattlenetAccount().RemoveFromWorld();
 
     // Remove items from world before self - player must be found in Item::RemoveFromObjectUpdate
     for (uint8 i = PLAYER_SLOT_START; i < PLAYER_SLOT_END; ++i)
@@ -3137,7 +3156,50 @@ bool Player::AddSpell(uint32 spellId, bool active, bool learning, bool dependent
     if (uint32 freeProfs = GetFreePrimaryProfessionPoints())
     {
         if (spellInfo->IsPrimaryProfessionFirstRank())
-            SetFreePrimaryProfessions(freeProfs - 1);
+        {
+            // A primary-profession slot must be consumed ONCE PER PROFESSION,
+            // not once per spell. Modern (12.0) profession data ships MULTIPLE
+            // first-rank spells that all teach the SAME profession skill — e.g.
+            // classic "Apprentice Skinning" (8613) and modern "Skinning"
+            // (205243) both grant skill 393 (Skinning) — and the skill-reward
+            // cascade auto-learns the modern one when the character has the
+            // profession. The old "decrement per first-rank spell" logic then
+            // counted one profession twice, exhausting the 2-slot cap (bots
+            // with only Skinning ended up with freeProf=0 and could never learn
+            // a real 2nd profession like Leatherworking). Only decrement when no
+            // OTHER known spell already teaches this same profession skill.
+            uint32 profSkill = 0;
+            for (SpellEffectInfo const& eff : spellInfo->GetEffects())
+                if (eff.IsEffect(SPELL_EFFECT_SKILL) && IsPrimaryProfessionSkill(uint32(eff.MiscValue)))
+                {
+                    profSkill = uint32(eff.MiscValue);
+                    break;
+                }
+
+            bool alreadyCounted = false;
+            if (profSkill)
+            {
+                for (auto const& [knownSpellId, knownSpell] : m_spells)
+                {
+                    if (knownSpellId == spellId || knownSpell.state == PLAYERSPELL_REMOVED)
+                        continue;
+                    SpellInfo const* knownInfo = sSpellMgr->GetSpellInfo(knownSpellId, DIFFICULTY_NONE);
+                    if (!knownInfo || !knownInfo->IsPrimaryProfessionFirstRank())
+                        continue;
+                    for (SpellEffectInfo const& e2 : knownInfo->GetEffects())
+                        if (e2.IsEffect(SPELL_EFFECT_SKILL) && uint32(e2.MiscValue) == profSkill)
+                        {
+                            alreadyCounted = true;
+                            break;
+                        }
+                    if (alreadyCounted)
+                        break;
+                }
+            }
+
+            if (!alreadyCounted)
+                SetFreePrimaryProfessions(freeProfs - 1);
+        }
     }
 
     SkillLineAbilityMapBounds skill_bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
@@ -3188,6 +3250,29 @@ bool Player::AddSpell(uint32 spellId, bool active, bool learning, bool dependent
 
                     if (rcInfo->Flags & SKILL_FLAG_ALWAYS_MAX_VALUE)
                         skill_value = new_skill_max_value;
+                }
+                else if (IsPrimaryProfessionSkill(spellLearnSkill->skill))
+                {
+                    // Modern 12.0+ client DB2 dropped SkillRaceClassInfo for
+                    // the classic primary-profession skill lines while the
+                    // foundation spells (2108 Apprentice LW etc.) are still
+                    // present with SPELL_EFFECT_SKILL. Without this branch,
+                    // learning the foundation spell adds it to the spellbook
+                    // but SetSkill writes value=0 max=0, leaving the player
+                    // unable to use the profession. Fall back to the classic
+                    // apprentice/journeyman/expert/artisan/master/grand-master
+                    // tier caps (75/150/225/300/375/450) — same tiering
+                    // BotSetupPipeline::DoLearnProfessions uses for L10+ bots
+                    // (verified working for 1351+ bots). Pinning value=1
+                    // matches an in-game "Learn Apprentice X" UX where the
+                    // profession appears at rank 1 of 75 immediately.
+                    static constexpr uint16 kPrimaryProfessionTierMax[] = { 75, 150, 225, 300, 375, 450 };
+                    uint8 stepIdx = spellLearnSkill->step ? spellLearnSkill->step - 1 : 0;
+                    if (stepIdx >= std::size(kPrimaryProfessionTierMax))
+                        stepIdx = std::size(kPrimaryProfessionTierMax) - 1;
+                    new_skill_max_value = kPrimaryProfessionTierMax[stepIdx];
+                    if (skill_value < 1)
+                        skill_value = 1;
                 }
             }
 
@@ -6491,7 +6576,7 @@ void Player::SendActionButtons(uint32 state) const
     SendDirectMessage(packet.Write());
 }
 
-bool Player::IsActionButtonDataValid(uint8 button, uint64 action, uint8 type) const
+bool Player::IsActionButtonDataValid(uint16 button, uint64 action, uint8 type) const
 {
     if (button >= MAX_ACTION_BUTTONS)
     {
@@ -6568,7 +6653,7 @@ bool Player::IsActionButtonDataValid(uint8 button, uint64 action, uint8 type) co
     return true;
 }
 
-ActionButton* Player::AddActionButton(uint8 button, uint64 action, uint8 type)
+ActionButton* Player::AddActionButton(uint16 button, uint64 action, uint8 type)
 {
     if (!IsActionButtonDataValid(button, action, type))
         return nullptr;
@@ -6584,7 +6669,7 @@ ActionButton* Player::AddActionButton(uint8 button, uint64 action, uint8 type)
     return &ab;
 }
 
-void Player::RemoveActionButton(uint8 button)
+void Player::RemoveActionButton(uint16 button)
 {
     ActionButtonList::iterator buttonItr = m_actionButtons.find(button);
     if (buttonItr == m_actionButtons.end() || buttonItr->second.uState == ACTIONBUTTON_DELETED)
@@ -6599,7 +6684,7 @@ void Player::RemoveActionButton(uint8 button)
         GetName(), GetGUID().ToString(), button);
 }
 
-ActionButton const* Player::GetActionButton(uint8 button)
+ActionButton const* Player::GetActionButton(uint16 button)
 {
     ActionButtonList::iterator buttonItr = m_actionButtons.find(button);
     if (buttonItr == m_actionButtons.end() || buttonItr->second.uState == ACTIONBUTTON_DELETED)
@@ -6661,6 +6746,20 @@ void Player::SendMessageToSet(WorldPacket const* data, Player const* skipped_rcv
 
 void Player::SendDirectMessage(WorldPacket const* data) const
 {
+    // Null-session guard. A Player can sit briefly in its map's grid
+    // *after* its WorldSession has been torn down — the logout flow
+    // detaches the session and queues the Player for grid removal, but
+    // the next world tick may still visit this Player via packet
+    // broadcasts (MessageDistDeliverer iterating a creature spell's
+    // visibility range), and this code dereferenced m_session
+    // unconditionally. Crash signature observed under V2 bot session
+    // churn: ACCESS_VIOLATION at this line, RAX=0, called from
+    // Spell::SendSpellStart → SendMessageToSetInRange → ... visiting a
+    // logging-out Player. Drop the packet silently — the player won't
+    // see the spell visual, which is the correct outcome since they're
+    // already gone.
+    if (!m_session)
+        return;
     m_session->SendPacket(data);
 }
 
@@ -10178,6 +10277,16 @@ bool Player::NeedsAmmo() const
     }
 }
 
+uint32 Player::GetAmmoDisplayId(ItemTemplate const* proto)
+{
+    if (!proto)
+        return 0;
+    if (ItemModifiedAppearanceEntry const* modifiedAppearance = TransmogMgr::GetItemModifiedAppearance(proto->GetId(), 0))
+        if (ItemAppearanceEntry const* itemAppearance = sItemAppearanceStore.LookupEntry(modifiedAppearance->ItemAppearanceID))
+            return itemAppearance->ItemDisplayInfoID;
+    return 0;
+}
+
 // Arrows for bows and crossbows, bullets for guns; without a ranged weapon any ammo can be chosen.
 bool Player::IsAmmoUsableWithRangedWeapon(ItemTemplate const* proto) const
 {
@@ -10206,21 +10315,32 @@ bool Player::SetAmmo(uint32 itemId)
 
 void Player::AutoSelectAmmo()
 {
+    // A bot has no client to choose its ammo: it takes a stack that is drawn with a model, not the generic white-box display.
+    bool const preferDrawable = GetSession() && GetSession()->IsBot();
     if (uint32 current = GetAmmoId())
-        if (HasItemCount(current) && IsAmmoUsableWithRangedWeapon(sObjectMgr->GetItemTemplate(current)))
+        if (HasItemCount(current) && IsAmmoUsableWithRangedWeapon(sObjectMgr->GetItemTemplate(current)) &&
+            (!preferDrawable || HasDrawableAmmoDisplay(sObjectMgr->GetItemTemplate(current))))
             return;
 
     uint32 found = 0;
+    uint32 foundDrawable = 0;
     ForEachItem(ItemSearchLocation::Inventory, [&](Item* item)
     {
         ItemTemplate const* proto = item->GetTemplate();
         if (proto->GetClass() == ITEM_CLASS_PROJECTILE && IsAmmoUsableWithRangedWeapon(proto) && CanUseItem(proto) == EQUIP_ERR_OK)
         {
-            found = item->GetEntry();
-            return ItemSearchCallbackResult::Stop;
+            if (!found)
+                found = item->GetEntry();
+            if (!preferDrawable || HasDrawableAmmoDisplay(proto))
+            {
+                foundDrawable = item->GetEntry();
+                return ItemSearchCallbackResult::Stop;
+            }
         }
         return ItemSearchCallbackResult::Continue;
     });
+    if (foundDrawable)
+        found = foundDrawable;
     SetAmmo(found);
 }
 
@@ -13938,6 +14058,17 @@ void Player::UpdateTradeState()
         TradeCancel(true, TRADE_STATUS_TOO_FAR_AWAY);
 }
 
+void Player::InitiateTrade(Player* trader)
+{
+    // PlayerBot integration: minimal core hook for trade initiation
+    // Pattern from TradeHandler.cpp:714-715
+    if (!trader || m_trade || trader->m_trade)
+        return;
+
+    m_trade = new TradeData(this, trader);
+    trader->m_trade = new TradeData(trader, this);
+}
+
 void Player::UpdateSoulboundTradeItems()
 {
     // also checks for garbage data
@@ -14808,7 +14939,20 @@ void Player::OnGossipSelect(WorldObject* source, int32 gossipOptionId, uint32 me
             }
             break;
         case GossipOptionNpc::Vendor:
-            GetSession()->SendListInventory(guid);
+            PlayerTalkClass->SendCloseGossip();
+            // Send NIOR only; don't send VendorInventory in the same flush.
+            // The client's NIOR case 5 handler queues a UI event that sets
+            // PIM+48 = Merchant(5) and opens MerchantFrame. The frame then
+            // requests vendor data via CMSG_LIST_INVENTORY in a second round-trip,
+            // by which time PIM+48 is set and IsSellAllJunkEnabled works.
+            PlayerTalkClass->GetInteractionData().StartInteraction(guid, PlayerInteractionType::Vendor);
+            {
+                WorldPackets::NPC::NPCInteractionOpenResult npcInteraction;
+                npcInteraction.Npc = guid;
+                npcInteraction.InteractionType = PlayerInteractionType::Merchant;
+                npcInteraction.Success = true;
+                SendDirectMessage(npcInteraction.Write());
+            }
             break;
         case GossipOptionNpc::Taxinode:
             GetSession()->SendTaxiMenu(source->ToCreature());
@@ -18164,6 +18308,7 @@ void Player::SendQuestConfirmAccept(Quest const* quest, Player* receiver) const
     packet.QuestTitle = quest->GetLogTitle();
     uint32 questID = quest->GetQuestId();
 
+    if (!receiver->GetSession()) return;   // logging-out — drop quest-share confirm
     LocaleConstant localeConstant = receiver->GetSession()->GetSessionDbLocaleIndex();
     if (localeConstant != LOCALE_enUS)
         if (QuestTemplateLocale const* questTemplateLocale = sObjectMgr->GetQuestLocale(questID))
@@ -19767,7 +19912,7 @@ void Player::_LoadActions(PreparedQueryResult result)
         do
         {
             Field* fields = result->Fetch();
-            uint8 button = fields[0].GetUInt8();
+            uint16 button = fields[0].GetUInt16();
             uint64 action = fields[1].GetUInt64();
             uint8 type = fields[2].GetUInt8();
 
@@ -19984,7 +20129,11 @@ void Player::_LoadInventory(PreparedQueryResult result, PreparedQueryResult arti
     //NOTE2: the "order by `slot`" is needed because mainhand weapons are (wrongly?)
     //expected to be equipped before offhand items (@todo fixme)
 
-    UpdateInventorySlotCount();
+    // The saved slot count was set from the character row. The +4 account-secured slots are only granted at the end of the login
+    // (WorldSession::HandlePlayerLogin, SetAccountSecured), so recomputing here would drop a secured character to 16 slots and
+    // mail every item stored in the extra slots; SetAccountSecured(false) takes the slots away later if the account lost them.
+    if (GetInventorySlotCount() < INVENTORY_DEFAULT_SIZE)
+        UpdateInventorySlotCount();
 
     std::unordered_map<ObjectGuid::LowType, ItemAdditionalLoadInfo> additionalData;
     ItemAdditionalLoadInfo::Init(&additionalData, artifactsResult, azeriteResult, azeriteItemMilestonePowersResult,
@@ -21701,7 +21850,7 @@ void Player::_SaveActions(CharacterDatabaseTransaction trans)
                 stmt->setUInt64(0, GetGUID().GetCounter());
                 stmt->setUInt8(1, GetActiveTalentGroup());
                 stmt->setInt32(2, traitConfigId);
-                stmt->setUInt8(3, itr->first);
+                stmt->setUInt16(3, itr->first);
                 stmt->setUInt64(4, itr->second.GetAction());
                 stmt->setUInt8(5, uint8(itr->second.GetType()));
                 trans->Append(stmt);
@@ -21714,7 +21863,7 @@ void Player::_SaveActions(CharacterDatabaseTransaction trans)
                 stmt->setUInt64(0, itr->second.GetAction());
                 stmt->setUInt8(1, uint8(itr->second.GetType()));
                 stmt->setUInt64(2, GetGUID().GetCounter());
-                stmt->setUInt8(3, itr->first);
+                stmt->setUInt16(3, itr->first);
                 stmt->setUInt8(4, GetActiveTalentGroup());
                 stmt->setInt32(5, traitConfigId);
                 trans->Append(stmt);
@@ -21725,7 +21874,7 @@ void Player::_SaveActions(CharacterDatabaseTransaction trans)
             case ACTIONBUTTON_DELETED:
                 stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_ACTION_BY_BUTTON_SPEC);
                 stmt->setUInt64(0, GetGUID().GetCounter());
-                stmt->setUInt8(1, itr->first);
+                stmt->setUInt16(1, itr->first);
                 stmt->setUInt8(2, GetActiveTalentGroup());
                 stmt->setInt32(3, traitConfigId);
                 trans->Append(stmt);
@@ -23151,7 +23300,7 @@ void Player::WhisperAddon(std::string const& text, std::string const& prefix, bo
     std::string _text(text);
     sScriptMgr->OnPlayerChat(this, CHAT_MSG_WHISPER, uint32(isLogged ? LANG_ADDON_LOGGED : LANG_ADDON), _text, receiver);
 
-    if (!receiver->GetSession()->IsAddonRegistered(prefix))
+    if (!receiver->GetSession() || !receiver->GetSession()->IsAddonRegistered(prefix))
         return;
 
     WorldPackets::Chat::Chat packet;
@@ -23219,6 +23368,7 @@ void Player::Whisper(uint32 textId, Player* target, bool /*isBossWhisper = false
         return;
     }
 
+    if (!target->GetSession()) return;   // logging-out target — drop the whisper
     LocaleConstant locale = target->GetSession()->GetSessionDbLocaleIndex();
     WorldPackets::Chat::Chat packet;
     packet.Initialize(CHAT_MSG_WHISPER, LANG_UNIVERSAL, this, target, DB2Manager::GetBroadcastTextValue(bct, locale, GetGender()));
@@ -25903,7 +26053,10 @@ void Player::SendInitialPacketsAfterAddToMap()
     // saved raid locks; the Classic client does not ask for them on its own
     SendRaidInfo();
 
-    CastSpell(this, 836, true);                             // LOGINEFFECT
+    // Skip LOGINEFFECT for bots - visual effect requires client rendering
+    // Bots don't send CMSG_CAST_SPELL ACKs, causing m_spellModTakingSpell assertion failures (Spell.cpp:603)
+    if (!GetSession()->IsBot())
+        CastSpell(this, 836, true);                         // LOGINEFFECT
 
     WorldPackets::Movement::MoveSetCompoundState setCompoundState;
 
@@ -26706,6 +26859,7 @@ bool Player::IsSpellFitByClassAndRace(uint32 spell_id, uint32 learnSpellDepth /*
         return true;
     }
 
+    bool primaryProfFitsByMasks = false;
     for (SkillLineAbilityMap::const_iterator _spell_idx = bounds.first; _spell_idx != bounds.second; ++_spell_idx)
     {
         // skip wrong race skills
@@ -26718,12 +26872,28 @@ bool Player::IsSpellFitByClassAndRace(uint32 spell_id, uint32 learnSpellDepth /*
 
         // skip wrong class and race skill saved in SkillRaceClassInfo.dbc
         if (!sDB2Manager.GetSkillRaceClassInfo(_spell_idx->second->SkillLine, GetRace(), GetClass()))
+        {
+            // Modern 12.0+ client DB2 dropped SkillRaceClassInfo entries
+            // for the classic primary-profession skill lines (165 LW, 164
+            // BS, 186 Mining, 182 Herbalism, 393 Skinning, etc.) while the
+            // spells (2108 Apprentice LW, 2018 Apprentice BS, ...) still
+            // exist and function via direct SetSkill — that's how
+            // BotSetupPipeline::DoLearnProfessions grants LW to 1351+ L10+
+            // bots. Without this fallback, trainer learn rejects every
+            // classic foundation profession spell for every race/class
+            // (manual play "click yes → nothing happens"), even though the
+            // race/class masks on the SkillLineAbility itself pass. Allow
+            // primary profession spells through when race+class masks
+            // pass and only rcInfo is missing.
+            if (IsPrimaryProfessionSkill(_spell_idx->second->SkillLine))
+                primaryProfFitsByMasks = true;
             continue;
+        }
 
         return true;
     }
 
-    return false;
+    return primaryProfFitsByMasks;
 }
 
 bool Player::HasQuestForGO(int32 GOId) const
