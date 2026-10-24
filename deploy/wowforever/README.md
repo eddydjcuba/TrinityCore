@@ -33,6 +33,26 @@ features remain compiled and can be evaluated separately with measured limits.
 The client build remains exactly `1.60.1.70425`. Keep `realmlist.gamebuild` aligned
 with the actual client; adding a row to build_info does not admit every version.
 
+## Local validation
+
+Windows RelWithDebInfo compiled successfully with all 13 PlayerbotV2 libraries.
+Copied auth/characters/world/hotfixes and a separate shared database were used
+for startup/migration testing. Quest masks from 120 were verified in the copy.
+The quest-hub startup scan originally remained busy beyond 140 seconds; keeping
+TerrainInfo references for the duration of the scan reduced it to 5.624 seconds
+for 146 hubs in this environment, without replacing terrain-derived zone IDs.
+
+Through loopback-only RA, `playerbot spawn 2` generated one valid bot and
+correctly rejected a reserved name, Champion. The valid bot entered the world;
+the status command reported one bot/session/snapshot, five executed intents and
+zero exceptions. `server exit` shut down the test runtime cleanly. The copied
+admin's game-account password was set only in test auth for RA validation;
+production Battle.net credentials were not changed.
+
+This is a startup/session smoke test, not evidence of completed raids, correct
+class balance or full Blizzard fidelity. Gameplay with the exact client remains
+the next validation step. Names rejected by the core must not bypass its filter.
+
 Back up auth, characters, world, hotfixes and the shared playerbot database
 together before future deployments. Binary rollback alone cannot undo bot
 characters, inventory or progression. Never deploy a repack over this runtime.
