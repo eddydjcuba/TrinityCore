@@ -28912,7 +28912,8 @@ void Player::EnablePvpRules(bool dueToCombat /*= false*/)
 {
     if (!HasPvpRulesEnabled())
     {
-        if (!HasSpell(195710)) // Honorable Medallion
+        // Classic clients do not carry the retail medallion teaching spell.
+        if (!HasSpell(195710) && sSpellMgr->GetSpellInfo(208682, DIFFICULTY_NONE)) // Honorable Medallion
             CastSpell(this, 208682, true); // Learn Gladiator's Medallion
 
         CastSpell(this, SPELL_PVP_RULES_ENABLED, true);

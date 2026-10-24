@@ -25,10 +25,23 @@ Their inclusion here is a local integration decision, not an upstream approval.
 | [68](https://github.com/advocaite/TrinityCore/pull/68) | Deferred | Changes the character uniqueness constraint, name cache and character packets. Requires surname-aware end-to-end tests on the exact client build before a character-schema migration. |
 | [67](https://github.com/advocaite/TrinityCore/pull/67) | Deferred | Large CLI rewrite, Windows explicitly untested, plus unrelated collision edits. Production console is disabled, so this is not a current blocker. |
 
-`zzzz-wowforever.conf` is loaded after distributed bot defaults. It caps initial
-world bots, enables companion/raid support and leaves economic automation,
-automated battleground population and nonstandard raid shortcuts off. These
-features remain compiled and can be evaluated separately with measured limits.
+`zzzz-wowforever.conf` is loaded after distributed bot defaults. The full profile
+uses a fixed fleet target of 100, companions/raid support, one seeded battleground,
+ambient BG queuing, guilds, session rotation, trade and neutral auction-house
+automation. Fixed population and proximity spawning are mutually exclusive, so
+World.Enable=0 is intentional in this mode. The root playerbot.conf must set the
+same TotalTarget=100 because it is loaded after the conf.d files.
+The World.RssBudgetMb setting only governs the inactive proximity mode; it is
+not a process-wide memory ceiling. Monitor the fixed fleet's measured footprint.
+Housing and arena seeding stay off for this Classic realm. Ordinary raid
+requirements and spell cast timings remain unchanged.
+
+The previous profile hit its 6000 MB proximity threshold during roster creation.
+The full profile was observed creating a WSG match, more than 80 online bots,
+auction listings and guild founder candidates. These are live startup observations,
+not complete validation of each dungeon, raid, profession or guild workflow.
+Retail medallion teaching is now guarded by the spell store lookup to avoid
+requesting spell208682 on Classic clients where it does not exist.
 
 The client build remains exactly `1.60.1.70425`. Keep `realmlist.gamebuild` aligned
 with the actual client; adding a row to build_info does not admit every version.
